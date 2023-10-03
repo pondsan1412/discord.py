@@ -1399,7 +1399,8 @@ def is_inside_class(func: Callable[..., Any]) -> bool:
     # Unfortunately, for nested functions this breaks. So inside an outer
     # function named outer, those two would end up having a qualname with
     # outer.<locals>.A.foo and outer.<locals>.foo
-
+ 
+ 
     if func.__qualname__ == func.__name__:
         return False
     (remaining, _, _) = func.__qualname__.rpartition('.')
