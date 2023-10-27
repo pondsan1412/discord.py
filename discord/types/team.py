@@ -1,7 +1,8 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-present Rapptz
+Copyright (c) 2015-2021 Rapptz
+Copyright (c) 2021-present Pycord Development
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -24,23 +25,22 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-from typing import Literal, TypedDict, List, Optional
+from typing import TypedDict
 
-from .user import PartialUser
 from .snowflake import Snowflake
+from .user import PartialUser
 
 
 class TeamMember(TypedDict):
     user: PartialUser
     membership_state: int
-    permissions: List[str]
+    permissions: list[str]
     team_id: Snowflake
-    role: Literal['admin', 'developer', 'read_only']
 
 
 class Team(TypedDict):
     id: Snowflake
     name: str
     owner_id: Snowflake
-    members: List[TeamMember]
-    icon: Optional[str]
+    members: list[TeamMember]
+    icon: str | None

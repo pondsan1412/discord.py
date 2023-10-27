@@ -1,7 +1,8 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-present Rapptz
+Copyright (c) 2015-2021 Rapptz
+Copyright (c) 2021-present Pycord Development
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -20,54 +21,65 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+Some documentation to refer to:
+
+- Our main web socket (mWS) sends opcode 4 with a guild ID and channel ID.
+- The mWS receives VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE.
+- We pull the session_id from VOICE_STATE_UPDATE.
+- We pull the token, endpoint and server_id from VOICE_SERVER_UPDATE.
+- Then we initiate the voice web socket (vWS) pointing to the endpoint.
+- We send opcode 0 with the user_id, server_id, session_id and token using the vWS.
+- The vWS sends back opcode 2 with an ssrc, port, modes(array) and heartbeat_interval.
+- We send a UDP discovery packet to endpoint:port and receive our IP and our port in LE.
+- Then we send our IP and port via vWS with opcode 1.
+- When that's all done, we receive opcode 4 from the vWS.
+- Finally we can transmit data to endpoint:port.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import select
+import socket
 import struct
-from typing import Any, Callable, List, Optional, TYPE_CHECKING, Tuple, Union
+import threading
+import time
+from typing import TYPE_CHECKING, Any, Callable
 
-from . import opus
+from . import opus, utils
+from .backoff import ExponentialBackoff
+from .errors import ClientException, ConnectionClosed
 from .gateway import *
-from .errors import ClientException
 from .player import AudioPlayer, AudioSource
+from .sinks import RawData, RecordingException, Sink
 from .utils import MISSING
-from .voice_state import VoiceConnectionState
 
 if TYPE_CHECKING:
-    from .gateway import DiscordVoiceWebSocket
+    from . import abc
     from .client import Client
     from .guild import Guild
+    from .opus import Encoder
     from .state import ConnectionState
+    from .types.voice import GuildVoiceState as GuildVoiceStatePayload
+    from .types.voice import SupportedModes
+    from .types.voice import VoiceServerUpdate as VoiceServerUpdatePayload
     from .user import ClientUser
-    from .opus import Encoder, APPLICATION_CTL, BAND_CTL, SIGNAL_CTL
-    from .channel import StageChannel, VoiceChannel
-    from . import abc
-
-    from .types.voice import (
-        GuildVoiceState as GuildVoiceStatePayload,
-        VoiceServerUpdate as VoiceServerUpdatePayload,
-        SupportedModes,
-    )
-
-    VocalGuildChannel = Union[VoiceChannel, StageChannel]
 
 
 has_nacl: bool
 
 try:
     import nacl.secret  # type: ignore
-    import nacl.utils  # type: ignore
 
     has_nacl = True
 except ImportError:
     has_nacl = False
 
 __all__ = (
-    'VoiceProtocol',
-    'VoiceClient',
+    "VoiceProtocol",
+    "VoiceClient",
 )
 
 
@@ -88,7 +100,7 @@ class VoiceProtocol:
     .. _Lavalink: https://github.com/freyacodes/Lavalink
 
     Parameters
-    ------------
+    ----------
     client: :class:`Client`
         The client (or its subclasses) that started the connection request.
     channel: :class:`abc.Connectable`
@@ -99,33 +111,41 @@ class VoiceProtocol:
         self.client: Client = client
         self.channel: abc.Connectable = channel
 
-    async def on_voice_state_update(self, data: GuildVoiceStatePayload, /) -> None:
+    async def on_voice_state_update(self, data: GuildVoiceStatePayload) -> None:
         """|coro|
 
         An abstract method that is called when the client's voice state
         has changed. This corresponds to ``VOICE_STATE_UPDATE``.
 
         Parameters
-        ------------
+        ----------
         data: :class:`dict`
-            The raw :ddocs:`voice state payload <resources/voice#voice-state-object>`.
+            The raw `voice state payload`__.
+
+            .. _voice_state_update_payload: https://discord.com/developers/docs/resources/voice#voice-state-object
+
+            __ voice_state_update_payload_
         """
         raise NotImplementedError
 
-    async def on_voice_server_update(self, data: VoiceServerUpdatePayload, /) -> None:
+    async def on_voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
         """|coro|
 
         An abstract method that is called when initially connecting to voice.
         This corresponds to ``VOICE_SERVER_UPDATE``.
 
         Parameters
-        ------------
+        ----------
         data: :class:`dict`
-            The raw :ddocs:`voice server update payload <topics/gateway#voice-server-update>`.
+            The raw `voice server update payload`__.
+
+            .. _voice_server_update_payload: https://discord.com/developers/docs/topics/gateway#voice-server-update-voice-server-update-event-fields
+
+            __ voice_server_update_payload_
         """
         raise NotImplementedError
 
-    async def connect(self, *, timeout: float, reconnect: bool, self_deaf: bool = False, self_mute: bool = False) -> None:
+    async def connect(self, *, timeout: float, reconnect: bool) -> None:
         """|coro|
 
         An abstract method called when the client initiates the connection request.
@@ -140,19 +160,11 @@ class VoiceProtocol:
         The order that these two are called is unspecified.
 
         Parameters
-        ------------
+        ----------
         timeout: :class:`float`
             The timeout for the connection.
         reconnect: :class:`bool`
             Whether reconnection is expected.
-        self_mute: :class:`bool`
-            Indicates if the client should be self-muted.
-
-            .. versionadded:: 2.0
-        self_deaf: :class:`bool`
-            Indicates if the client should be self-deafened.
-
-            .. versionadded:: 2.0
         """
         raise NotImplementedError
 
@@ -164,7 +176,7 @@ class VoiceProtocol:
         See :meth:`cleanup`.
 
         Parameters
-        ------------
+        ----------
         force: :class:`bool`
             Whether the disconnection was forced.
         """
@@ -190,96 +202,87 @@ class VoiceClient(VoiceProtocol):
     You do not create these, you typically get them from
     e.g. :meth:`VoiceChannel.connect`.
 
-    Warning
-    --------
-    In order to use PCM based AudioSources, you must have the opus library
-    installed on your system and loaded through :func:`opus.load_opus`.
-    Otherwise, your AudioSources must be opus encoded (e.g. using :class:`FFmpegOpusAudio`)
-    or the library will not be able to transmit audio.
-
     Attributes
-    -----------
+    ----------
     session_id: :class:`str`
         The voice connection session ID.
     token: :class:`str`
         The voice connection token.
     endpoint: :class:`str`
         The endpoint we are connecting to.
-    channel: Union[:class:`VoiceChannel`, :class:`StageChannel`]
+    channel: :class:`abc.Connectable`
         The voice channel connected to.
+    loop: :class:`asyncio.AbstractEventLoop`
+        The event loop that the voice client is running on.
+
+    Warning
+    -------
+    In order to use PCM based AudioSources, you must have the opus library
+    installed on your system and loaded through :func:`opus.load_opus`.
+    Otherwise, your AudioSources must be opus encoded (e.g. using :class:`FFmpegOpusAudio`)
+    or the library will not be able to transmit audio.
     """
 
-    channel: VocalGuildChannel
+    endpoint_ip: str
+    voice_port: int
+    secret_key: list[int]
+    ssrc: int
 
-    def __init__(self, client: Client, channel: abc.Connectable) -> None:
+    def __init__(self, client: Client, channel: abc.Connectable):
         if not has_nacl:
             raise RuntimeError("PyNaCl library needed in order to use voice")
 
         super().__init__(client, channel)
         state = client._connection
-        self.server_id: int = MISSING
+        self.token: str = MISSING
         self.socket = MISSING
         self.loop: asyncio.AbstractEventLoop = state.loop
         self._state: ConnectionState = state
+        # this will be used in the AudioPlayer thread
+        self._connected: threading.Event = threading.Event()
 
+        self._handshaking: bool = False
+        self._potentially_reconnecting: bool = False
+        self._voice_state_complete: asyncio.Event = asyncio.Event()
+        self._voice_server_complete: asyncio.Event = asyncio.Event()
+
+        self.mode: str = MISSING
+        self._connections: int = 0
         self.sequence: int = 0
         self.timestamp: int = 0
-        self._player: Optional[AudioPlayer] = None
+        self.timeout: float = 0
+        self._runner: asyncio.Task = MISSING
+        self._player: AudioPlayer | None = None
         self.encoder: Encoder = MISSING
+        self.decoder = None
         self._lite_nonce: int = 0
+        self.ws: DiscordVoiceWebSocket = MISSING
 
-        self._connection: VoiceConnectionState = self.create_connection_state()
+        self.paused = False
+        self.recording = False
+        self.user_timestamps = {}
+        self.sink = None
+        self.starting_time = None
+        self.stopping_time = None
 
-    warn_nacl: bool = not has_nacl
-    supported_modes: Tuple[SupportedModes, ...] = (
-        'xsalsa20_poly1305_lite',
-        'xsalsa20_poly1305_suffix',
-        'xsalsa20_poly1305',
+    warn_nacl = not has_nacl
+    supported_modes: tuple[SupportedModes, ...] = (
+        "xsalsa20_poly1305_lite",
+        "xsalsa20_poly1305_suffix",
+        "xsalsa20_poly1305",
     )
 
     @property
-    def guild(self) -> Guild:
-        """:class:`Guild`: The guild we're connected to."""
-        return self.channel.guild
+    def guild(self) -> Guild | None:
+        """The guild we're connected to, if applicable."""
+        return getattr(self.channel, "guild", None)
 
     @property
     def user(self) -> ClientUser:
-        """:class:`ClientUser`: The user connected to voice (i.e. ourselves)."""
-        return self._state.user  # type: ignore
+        """The user connected to voice (i.e. ourselves)."""
+        return self._state.user
 
-    @property
-    def session_id(self) -> Optional[str]:
-        return self._connection.session_id
-
-    @property
-    def token(self) -> Optional[str]:
-        return self._connection.token
-
-    @property
-    def endpoint(self) -> Optional[str]:
-        return self._connection.endpoint
-
-    @property
-    def ssrc(self) -> int:
-        return self._connection.ssrc
-
-    @property
-    def mode(self) -> SupportedModes:
-        return self._connection.mode
-
-    @property
-    def secret_key(self) -> List[int]:
-        return self._connection.secret_key
-
-    @property
-    def ws(self) -> DiscordVoiceWebSocket:
-        return self._connection.ws
-
-    @property
-    def timeout(self) -> float:
-        return self._connection.timeout
-
-    def checked_add(self, attr: str, value: int, limit: int) -> None:
+    def checked_add(self, attr, value, limit):
         val = getattr(self, attr)
         if val + value > limit:
             setattr(self, attr, 0)
@@ -288,78 +291,262 @@ class VoiceClient(VoiceProtocol):
 
     # connection related
 
-    def create_connection_state(self) -> VoiceConnectionState:
-        return VoiceConnectionState(self)
-
     async def on_voice_state_update(self, data: GuildVoiceStatePayload) -> None:
-        await self._connection.voice_state_update(data)
+        self.session_id = data["session_id"]
+        channel_id = data["channel_id"]
+
+        if not self._handshaking or self._potentially_reconnecting:
+            # If we're done handshaking then we just need to update ourselves
+            # If we're potentially reconnecting due to a 4014, then we need to differentiate
+            # a channel move and an actual force disconnect
+            if channel_id is None:
+                # We're being disconnected so cleanup
+                await self.disconnect()
+            else:
+                guild = self.guild
+                self.channel = channel_id and guild and guild.get_channel(int(channel_id))  # type: ignore
+        else:
+            self._voice_state_complete.set()
 
     async def on_voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
-        await self._connection.voice_server_update(data)
+        if self._voice_server_complete.is_set():
+            _log.info("Ignoring extraneous voice server update.")
+            return
 
-    async def connect(self, *, reconnect: bool, timeout: float, self_deaf: bool = False, self_mute: bool = False) -> None:
-        await self._connection.connect(
-            reconnect=reconnect, timeout=timeout, self_deaf=self_deaf, self_mute=self_mute, resume=False
+        self.token = data.get("token")
+        self.server_id = int(data["guild_id"])
+        endpoint = data.get("endpoint")
+
+        if endpoint is None or self.token is None:
+            _log.warning(
+                "Awaiting endpoint... This requires waiting. "
+                "If timeout occurred considering raising the timeout and reconnecting."
+            )
+            return
+
+        self.endpoint, _, _ = endpoint.rpartition(":")
+        if self.endpoint.startswith("wss://"):
+            # Just in case, strip it off since we're going to add it later
+            self.endpoint = self.endpoint[6:]
+
+        # This gets set later
+        self.endpoint_ip = MISSING
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setblocking(False)
+
+        if not self._handshaking:
+            # If we're not handshaking then we need to terminate our previous connection in the websocket
+            await self.ws.close(4000)
+            return
+
+        self._voice_server_complete.set()
+
+    async def voice_connect(self) -> None:
+        await self.channel.guild.change_voice_state(channel=self.channel)
+
+    async def voice_disconnect(self) -> None:
+        _log.info(
+            "The voice handshake is being terminated for Channel ID %s (Guild ID %s)",
+            self.channel.id,
+            self.guild.id,
         )
+        await self.channel.guild.change_voice_state(channel=None)
 
-    def wait_until_connected(self, timeout: Optional[float] = 30.0) -> bool:
-        self._connection.wait(timeout)
-        return self._connection.is_connected()
+    def prepare_handshake(self) -> None:
+        self._voice_state_complete.clear()
+        self._voice_server_complete.clear()
+        self._handshaking = True
+        _log.info(
+            "Starting voice handshake... (connection attempt %d)", self._connections + 1
+        )
+        self._connections += 1
+
+    def finish_handshake(self) -> None:
+        _log.info("Voice handshake complete. Endpoint found %s", self.endpoint)
+        self._handshaking = False
+        self._voice_server_complete.clear()
+        self._voice_state_complete.clear()
+
+    async def connect_websocket(self) -> DiscordVoiceWebSocket:
+        ws = await DiscordVoiceWebSocket.from_client(self)
+        self._connected.clear()
+        while ws.secret_key is None:
+            await ws.poll_event()
+        self._connected.set()
+        return ws
+
+    async def connect(self, *, reconnect: bool, timeout: float) -> None:
+        _log.info("Connecting to voice...")
+        self.timeout = timeout
+
+        for i in range(5):
+            self.prepare_handshake()
+
+            # This has to be created before we start the flow.
+            futures = [
+                self._voice_state_complete.wait(),
+                self._voice_server_complete.wait(),
+            ]
+
+            # Start the connection flow
+            await self.voice_connect()
+
+            try:
+                await utils.sane_wait_for(futures, timeout=timeout)
+            except asyncio.TimeoutError:
+                await self.disconnect(force=True)
+                raise
+
+            self.finish_handshake()
+
+            try:
+                self.ws = await self.connect_websocket()
+                break
+            except (ConnectionClosed, asyncio.TimeoutError):
+                if reconnect:
+                    _log.exception("Failed to connect to voice... Retrying...")
+                    await asyncio.sleep(1 + i * 2.0)
+                    await self.voice_disconnect()
+                    continue
+                else:
+                    raise
+
+        if self._runner is MISSING:
+            self._runner = self.loop.create_task(self.poll_voice_ws(reconnect))
+
+    async def potential_reconnect(self) -> bool:
+        # Attempt to stop the player thread from playing early
+        self._connected.clear()
+        self.prepare_handshake()
+        self._potentially_reconnecting = True
+        try:
+            # We only care about VOICE_SERVER_UPDATE since VOICE_STATE_UPDATE can come before we get disconnected
+            await asyncio.wait_for(
+                self._voice_server_complete.wait(), timeout=self.timeout
+            )
+        except asyncio.TimeoutError:
+            self._potentially_reconnecting = False
+            await self.disconnect(force=True)
+            return False
+
+        self.finish_handshake()
+        self._potentially_reconnecting = False
+        try:
+            self.ws = await self.connect_websocket()
+        except (ConnectionClosed, asyncio.TimeoutError):
+            return False
+        else:
+            return True
 
     @property
     def latency(self) -> float:
-        """:class:`float`: Latency between a HEARTBEAT and a HEARTBEAT_ACK in seconds.
+        """Latency between a HEARTBEAT and a HEARTBEAT_ACK in seconds.
 
         This could be referred to as the Discord Voice WebSocket latency and is
         an analogue of user's voice latencies as seen in the Discord client.
 
         .. versionadded:: 1.4
         """
-        ws = self._connection.ws
+        ws = self.ws
         return float("inf") if not ws else ws.latency
 
     @property
     def average_latency(self) -> float:
-        """:class:`float`: Average of most recent 20 HEARTBEAT latencies in seconds.
+        """Average of most recent 20 HEARTBEAT latencies in seconds.
 
         .. versionadded:: 1.4
         """
-        ws = self._connection.ws
+        ws = self.ws
         return float("inf") if not ws else ws.average_latency
+
+    async def poll_voice_ws(self, reconnect: bool) -> None:
+        backoff = ExponentialBackoff()
+        while True:
+            try:
+                await self.ws.poll_event()
+            except (ConnectionClosed, asyncio.TimeoutError) as exc:
+                if isinstance(exc, ConnectionClosed):
+                    # The following close codes are undocumented, so I will document them here.
+                    # 1000 - normal closure (obviously)
+                    # 4014 - voice channel has been deleted.
+                    # 4015 - voice server has crashed
+                    if exc.code in (1000, 4015):
+                        _log.info(
+                            "Disconnecting from voice normally, close code %d.",
+                            exc.code,
+                        )
+                        await self.disconnect()
+                        break
+                    if exc.code == 4014:
+                        _log.info(
+                            "Disconnected from voice by force... potentially"
+                            " reconnecting."
+                        )
+                        successful = await self.potential_reconnect()
+                        if successful:
+                            continue
+
+                        _log.info(
+                            "Reconnect was unsuccessful, disconnecting from voice"
+                            " normally..."
+                        )
+                        await self.disconnect()
+                        break
+                if not reconnect:
+                    await self.disconnect()
+                    raise
+
+                retry = backoff.delay()
+                _log.exception(
+                    "Disconnected from voice... Reconnecting in %.2fs.", retry
+                )
+                self._connected.clear()
+                await asyncio.sleep(retry)
+                await self.voice_disconnect()
+                try:
+                    await self.connect(reconnect=True, timeout=self.timeout)
+                except asyncio.TimeoutError:
+                    # at this point we've retried 5 times... let's continue the loop.
+                    _log.warning("Could not connect to voice... Retrying...")
+                    continue
 
     async def disconnect(self, *, force: bool = False) -> None:
         """|coro|
 
         Disconnects this voice client from voice.
         """
-        self.stop()
-        await self._connection.disconnect(force=force)
-        self.cleanup()
+        if not force and not self.is_connected():
+            return
 
-    async def move_to(self, channel: Optional[abc.Snowflake], *, timeout: Optional[float] = 30.0) -> None:
+        self.stop()
+        self._connected.clear()
+
+        try:
+            if self.ws:
+                await self.ws.close()
+
+            await self.voice_disconnect()
+        finally:
+            self.cleanup()
+            if self.socket:
+                self.socket.close()
+
+    async def move_to(self, channel: abc.Snowflake) -> None:
         """|coro|
 
         Moves you to a different voice channel.
 
         Parameters
-        -----------
-        channel: Optional[:class:`abc.Snowflake`]
+        ----------
+        channel: :class:`abc.Snowflake`
             The channel to move to. Must be a voice channel.
-        timeout: Optional[:class:`float`]
-            How long to wait for the move to complete.
-
-            .. versionadded:: 2.4
-
-        Raises
-        -------
-        asyncio.TimeoutError
-            The move did not complete in time, but may still be ongoing.
         """
-        await self._connection.move_to(channel, timeout)
+        await self.channel.guild.change_voice_state(channel=channel)
 
     def is_connected(self) -> bool:
         """Indicates if the voice client is connected to voice."""
-        return self._connection.is_connected()
+        return self._connected.is_set()
 
     # audio related
 
@@ -369,11 +556,11 @@ class VoiceClient(VoiceProtocol):
         # Formulate rtp header
         header[0] = 0x80
         header[1] = 0x78
-        struct.pack_into('>H', header, 2, self.sequence)
-        struct.pack_into('>I', header, 4, self.timestamp)
-        struct.pack_into('>I', header, 8, self.ssrc)
+        struct.pack_into(">H", header, 2, self.sequence)
+        struct.pack_into(">I", header, 4, self.timestamp)
+        struct.pack_into(">I", header, 8, self.ssrc)
 
-        encrypt_packet = getattr(self, '_encrypt_' + self.mode)
+        encrypt_packet = getattr(self, f"_encrypt_{self.mode}")
         return encrypt_packet(header, data)
 
     def _encrypt_xsalsa20_poly1305(self, header: bytes, data) -> bytes:
@@ -393,22 +580,51 @@ class VoiceClient(VoiceProtocol):
         box = nacl.secret.SecretBox(bytes(self.secret_key))
         nonce = bytearray(24)
 
-        nonce[:4] = struct.pack('>I', self._lite_nonce)
-        self.checked_add('_lite_nonce', 1, 4294967295)
+        nonce[:4] = struct.pack(">I", self._lite_nonce)
+        self.checked_add("_lite_nonce", 1, 4294967295)
 
         return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
 
+    def _decrypt_xsalsa20_poly1305(self, header, data):
+        box = nacl.secret.SecretBox(bytes(self.secret_key))
+
+        nonce = bytearray(24)
+        nonce[:12] = header
+
+        return self.strip_header_ext(box.decrypt(bytes(data), bytes(nonce)))
+
+    def _decrypt_xsalsa20_poly1305_suffix(self, header, data):
+        box = nacl.secret.SecretBox(bytes(self.secret_key))
+
+        nonce_size = nacl.secret.SecretBox.NONCE_SIZE
+        nonce = data[-nonce_size:]
+
+        return self.strip_header_ext(box.decrypt(bytes(data[:-nonce_size]), nonce))
+
+    def _decrypt_xsalsa20_poly1305_lite(self, header, data):
+        box = nacl.secret.SecretBox(bytes(self.secret_key))
+
+        nonce = bytearray(24)
+        nonce[:4] = data[-4:]
+        data = data[:-4]
+
+        return self.strip_header_ext(box.decrypt(bytes(data), bytes(nonce)))
+
+    @staticmethod
+    def strip_header_ext(data):
+        if data[0] == 0xBE and data[1] == 0xDE and len(data) > 4:
+            _, length = struct.unpack_from(">HH", data)
+            offset = 4 + length * 4
+            data = data[offset:]
+        return data
+
+    def get_ssrc(self, user_id):
+        return {info["user_id"]: ssrc for ssrc, info in self.ws.ssrc_map.items()}[
+            user_id
+        ]
+
     def play(
-        self,
-        source: AudioSource,
-        *,
-        after: Optional[Callable[[Optional[Exception]], Any]] = None,
-        application: APPLICATION_CTL = 'audio',
-        bitrate: int = 128,
-        fec: bool = True,
-        expected_packet_loss: float = 0.15,
-        bandwidth: BAND_CTL = 'full',
-        signal_type: SIGNAL_CTL = 'auto',
+        self, source: AudioSource, *, after: Callable[[Exception | None], Any] = None
     ) -> None:
         """Plays an :class:`AudioSource`.
 
@@ -416,81 +632,213 @@ class VoiceClient(VoiceProtocol):
         or an error occurred.
 
         If an error happens while the audio player is running, the exception is
-        caught and the audio player is then stopped.  If no after callback is
-        passed, any caught exception will be logged using the library logger.
-
-        Extra parameters may be passed to the internal opus encoder if a PCM based
-        source is used.  Otherwise, they are ignored.
-
-        .. versionchanged:: 2.0
-            Instead of writing to ``sys.stderr``, the library's logger is used.
-
-        .. versionchanged:: 2.4
-            Added encoder parameters as keyword arguments.
+        caught and the audio player is then stopped. If no after callback is
+        passed, any caught exception will be displayed as if it were raised.
 
         Parameters
-        -----------
+        ----------
         source: :class:`AudioSource`
             The audio source we're reading from.
         after: Callable[[Optional[:class:`Exception`]], Any]
             The finalizer that is called after the stream is exhausted.
             This function must have a single parameter, ``error``, that
             denotes an optional exception that was raised during playing.
-        application: :class:`str`
-            Configures the encoder's intended application.  Can be one of:
-            ``'audio'``, ``'voip'``, ``'lowdelay'``.
-            Defaults to ``'audio'``.
-        bitrate: :class:`int`
-            Configures the bitrate in the encoder.  Can be between ``16`` and ``512``.
-            Defaults to ``128``.
-        fec: :class:`bool`
-            Configures the encoder's use of inband forward error correction.
-            Defaults to ``True``.
-        expected_packet_loss: :class:`float`
-            Configures the encoder's expected packet loss percentage.  Requires FEC.
-            Defaults to ``0.15``.
-        bandwidth: :class:`str`
-            Configures the encoder's bandpass.  Can be one of:
-            ``'narrow'``, ``'medium'``, ``'wide'``, ``'superwide'``, ``'full'``.
-            Defaults to ``'full'``.
-        signal_type: :class:`str`
-            Configures the type of signal being encoded.  Can be one of:
-            ``'auto'``, ``'voice'``, ``'music'``.
-            Defaults to ``'auto'``.
 
         Raises
-        -------
+        ------
         ClientException
             Already playing audio or not connected.
         TypeError
             Source is not a :class:`AudioSource` or after is not a callable.
         OpusNotLoaded
             Source is not opus encoded and opus is not loaded.
-        ValueError
-            An improper value was passed as an encoder parameter.
         """
 
         if not self.is_connected():
-            raise ClientException('Not connected to voice.')
+            raise ClientException("Not connected to voice.")
 
         if self.is_playing():
-            raise ClientException('Already playing audio.')
+            raise ClientException("Already playing audio.")
 
         if not isinstance(source, AudioSource):
-            raise TypeError(f'source must be an AudioSource not {source.__class__.__name__}')
-
-        if not source.is_opus():
-            self.encoder = opus.Encoder(
-                application=application,
-                bitrate=bitrate,
-                fec=fec,
-                expected_packet_loss=expected_packet_loss,
-                bandwidth=bandwidth,
-                signal_type=signal_type,
+            raise TypeError(
+                f"source must be an AudioSource not {source.__class__.__name__}"
             )
+
+        if not self.encoder and not source.is_opus():
+            self.encoder = opus.Encoder()
 
         self._player = AudioPlayer(source, self, after=after)
         self._player.start()
+
+    def unpack_audio(self, data):
+        """Takes an audio packet received from Discord and decodes it into pcm audio data.
+        If there are no users talking in the channel, `None` will be returned.
+
+        You must be connected to receive audio.
+
+        .. versionadded:: 2.0
+
+        Parameters
+        ----------
+        data: :class:`bytes`
+            Bytes received by Discord via the UDP connection used for sending and receiving voice data.
+        """
+        if 200 <= data[1] <= 204:
+            # RTCP received.
+            # RTCP provides information about the connection
+            # as opposed to actual audio data, so it's not
+            # important at the moment.
+            return
+        if self.paused:
+            return
+
+        data = RawData(data, self)
+
+        if data.decrypted_data == b"\xf8\xff\xfe":  # Frame of silence
+            return
+
+        self.decoder.decode(data)
+
+    def start_recording(self, sink, callback, *args):
+        """The bot will begin recording audio from the current voice channel it is in.
+        This function uses a thread so the current code line will not be stopped.
+        Must be in a voice channel to use.
+        Must not be already recording.
+
+        .. versionadded:: 2.0
+
+        Parameters
+        ----------
+        sink: :class:`.Sink`
+            A Sink which will "store" all the audio data.
+        callback: :ref:`coroutine <coroutine>`
+            A function which is called after the bot has stopped recording.
+        *args:
+            Args which will be passed to the callback function.
+
+        Raises
+        ------
+        RecordingException
+            Not connected to a voice channel.
+        RecordingException
+            Already recording.
+        RecordingException
+            Must provide a Sink object.
+        """
+        if not self.is_connected():
+            raise RecordingException("Not connected to voice channel.")
+        if self.recording:
+            raise RecordingException("Already recording.")
+        if not isinstance(sink, Sink):
+            raise RecordingException("Must provide a Sink object.")
+
+        self.empty_socket()
+
+        self.decoder = opus.DecodeManager(self)
+        self.decoder.start()
+        self.recording = True
+        self.sink = sink
+        sink.init(self)
+
+        t = threading.Thread(
+            target=self.recv_audio,
+            args=(
+                sink,
+                callback,
+                *args,
+            ),
+        )
+        t.start()
+
+    def stop_recording(self):
+        """Stops the recording.
+        Must be already recording.
+
+        .. versionadded:: 2.0
+
+        Raises
+        ------
+        RecordingException
+            Not currently recording.
+        """
+        if not self.recording:
+            raise RecordingException("Not currently recording audio.")
+        self.decoder.stop()
+        self.recording = False
+        self.paused = False
+
+    def toggle_pause(self):
+        """Pauses or unpauses the recording.
+        Must be already recording.
+
+        .. versionadded:: 2.0
+
+        Raises
+        ------
+        RecordingException
+            Not currently recording.
+        """
+        if not self.recording:
+            raise RecordingException("Not currently recording audio.")
+        self.paused = not self.paused
+
+    def empty_socket(self):
+        while True:
+            ready, _, _ = select.select([self.socket], [], [], 0.0)
+            if not ready:
+                break
+            for s in ready:
+                s.recv(4096)
+
+    def recv_audio(self, sink, callback, *args):
+        # Gets data from _recv_audio and sorts
+        # it by user, handles pcm files and
+        # silence that should be added.
+
+        self.user_timestamps = {}
+        self.starting_time = time.perf_counter()
+        while self.recording:
+            ready, _, err = select.select([self.socket], [], [self.socket], 0.01)
+            if not ready:
+                if err:
+                    print(f"Socket error: {err}")
+                continue
+
+            try:
+                data = self.socket.recv(4096)
+            except OSError:
+                self.stop_recording()
+                continue
+
+            self.unpack_audio(data)
+
+        self.stopping_time = time.perf_counter()
+        self.sink.cleanup()
+        callback = asyncio.run_coroutine_threadsafe(
+            callback(self.sink, *args), self.loop
+        )
+        result = callback.result()
+
+        if result is not None:
+            print(result)
+
+    def recv_decoded_audio(self, data):
+        if data.ssrc not in self.user_timestamps:
+            self.user_timestamps.update({data.ssrc: data.timestamp})
+            # Add silence when they were not being recorded.
+            silence = 0
+        else:
+            silence = data.timestamp - self.user_timestamps[data.ssrc] - 960
+            self.user_timestamps[data.ssrc] = data.timestamp
+
+        data.decoded_data = (
+            struct.pack("<h", 0) * silence * opus._OpusStruct.CHANNELS
+            + data.decoded_data
+        )
+        while data.ssrc not in self.ws.ssrc_map:
+            time.sleep(0.05)
+        self.sink.write(data.decoded_data, self.ws.ssrc_map[data.ssrc]["user_id"])
 
     def is_playing(self) -> bool:
         """Indicates if we're currently playing audio."""
@@ -517,8 +865,8 @@ class VoiceClient(VoiceProtocol):
             self._player.resume()
 
     @property
-    def source(self) -> Optional[AudioSource]:
-        """Optional[:class:`AudioSource`]: The audio source being played, if playing.
+    def source(self) -> AudioSource | None:
+        """The audio source being played, if playing.
 
         This property can also be used to change the audio source currently being played.
         """
@@ -527,12 +875,12 @@ class VoiceClient(VoiceProtocol):
     @source.setter
     def source(self, value: AudioSource) -> None:
         if not isinstance(value, AudioSource):
-            raise TypeError(f'expected AudioSource not {value.__class__.__name__}.')
+            raise TypeError(f"expected AudioSource not {value.__class__.__name__}.")
 
         if self._player is None:
-            raise ValueError('Not playing anything.')
+            raise ValueError("Not playing anything.")
 
-        self._player.set_source(value)
+        self._player._set_source(value)
 
     def send_audio_packet(self, data: bytes, *, encode: bool = True) -> None:
         """Sends an audio packet composed of the data.
@@ -547,22 +895,28 @@ class VoiceClient(VoiceProtocol):
             Indicates if ``data`` should be encoded into Opus.
 
         Raises
-        -------
+        ------
         ClientException
             You are not connected.
         opus.OpusError
             Encoding the data failed.
         """
 
-        self.checked_add('sequence', 1, 65535)
+        self.checked_add("sequence", 1, 65535)
         if encode:
+            if not self.encoder:
+                self.encoder = opus.Encoder()
             encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
         else:
             encoded_data = data
         packet = self._get_voice_packet(encoded_data)
         try:
-            self._connection.send_packet(packet)
-        except OSError:
-            _log.info('A packet has been dropped (seq: %s, timestamp: %s)', self.sequence, self.timestamp)
+            self.socket.sendto(packet, (self.endpoint_ip, self.voice_port))
+        except BlockingIOError:
+            _log.warning(
+                "A packet has been dropped (seq: %s, timestamp: %s)",
+                self.sequence,
+                self.timestamp,
+            )
 
-        self.checked_add('timestamp', opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
+        self.checked_add("timestamp", opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
